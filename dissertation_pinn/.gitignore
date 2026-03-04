@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Training outputs (too large for GitHub)
+*.pt
+*.npy
+*.zip
+
+# Figures (optional — remove if you want to keep them)
+*.png
+
+# Kaggle/Colab artifacts
+.ipynb_checkpoints/
+geometry_data/
+trained_models/
