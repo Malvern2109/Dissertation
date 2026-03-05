@@ -563,12 +563,15 @@ class AneurysmTrainer:
 
             if it % check_grad_every == 0:
                 try:
-    dom, norms, ratio = check_gradient_dominance(
-                    self.model, [Lm, Lc, Lbc]
-                )
-                if dom:
-                    print(f"  [WARN] Gradient dominance at iter {it}: "
-                          f"ratio={ratio:.1f}")
+                    dom, norms, ratio = check_gradient_dominance(
+                        self.model, [Lm, Lc, Lbc]
+                    )
+                    if dom:
+                        print(f"  [WARN] Gradient dominance at iter {it}: "
+                              f"ratio={ratio:.1f}")
+                except RuntimeError:
+                    dom = False
+                    print(f"  [GradCheck {it}] skipped (graph freed)")
 
         print(f"Adam complete (Re={Re}). "
               f"Final loss: {self.history['loss'][-1]:.4e}")
