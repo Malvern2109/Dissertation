@@ -507,7 +507,7 @@ class AneurysmTrainer:
         """Single forward/physics pass."""
         # Physics residuals at interior points
         derivs = compute_full_derivatives(self.model, x_int)
-        R_cont, R_x, R_y, R_z = physics_residuals_carreau_yasuda(
+        R_cont, R_x, R_y, R_z, _mu = physics_residuals_carreau_yasuda(
             derivs, self.norm.x_range
         )
 
