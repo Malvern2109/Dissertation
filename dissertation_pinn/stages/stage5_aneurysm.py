@@ -320,6 +320,7 @@ class AneurysmLoss:
     """
 
     def __init__(self,
+                 u_max:  float = 0.01,
                  w_mom:  float = 1.0,
                  w_cont: float = 1.0,
                  w_wall: float = 10.0,
@@ -327,6 +328,7 @@ class AneurysmLoss:
                  w_in:   float = 15.0,
                  w_out:  float = 5.0,
                  w_pref: float = 2.0):
+        self.u_max  = u_max
         self.w_mom  = w_mom
         self.w_cont = w_cont
         self.w_wall = w_wall
@@ -336,8 +338,15 @@ class AneurysmLoss:
         self.w_pref = w_pref
 
     def momentum_loss(self, R_x, R_y, R_z):
-        P_SCALE = 1060.0 * 0.40684**2 + 1e-10
-        return (torch.mean((R_x/P_SCALE)**2) + torch.mean((R_y/P_SCALE)**2) + torch.mean((R_z/P_SCALE)**2)) / 3.0
+        # Normalise by rho*u_max^2 to bring raw momentum residuals (O(1e6-1e7))
+        # down to O(1), matching the scale of BC losses.  Without this, the
+        # physics gradient dwarfs the inlet gradient and the parabolic profile
+        # is never learned — the same fix that made Stage 2 pass AC1 (Section
+        # 3.4.5, P_SCALE in CompositeLoss.momentum_loss).
+        P_SCALE = RHO * self.u_max**2 + 1e-10
+        return (torch.mean((R_x / P_SCALE)**2) +
+                torch.mean((R_y / P_SCALE)**2) +
+                torch.mean((R_z / P_SCALE)**2)) / 3.0
 
     def continuity_loss(self, R_cont):
         return torch.mean(R_cont**2)
@@ -463,6 +472,10 @@ class AneurysmTrainer:
             "L_wall": [], "L_neck": [], "L_in": [],
             "L_out": [], "L_pref": []
         }
+        # Best-state tracking: save the lowest-loss checkpoint during Adam
+        # and restore it before L-BFGS fine-tuning (mirrors Stage 2 protocol).
+        self.best_loss  = float("inf")
+        self.best_state = None
 
     def _prepare_tensors(self, n_sub: int = None):
         """Build normalised tensors; optionally subsample interior."""
@@ -494,7 +507,7 @@ class AneurysmTrainer:
         """Single forward/physics pass."""
         # Physics residuals at interior points
         derivs = compute_full_derivatives(self.model, x_int)
-        R_cont, R_x, R_y, R_z, *_ = physics_residuals_carreau_yasuda(
+        R_cont, R_x, R_y, R_z = physics_residuals_carreau_yasuda(
             derivs, self.norm.x_range
         )
 
@@ -513,6 +526,90 @@ class AneurysmTrainer:
             uvwp_sac
         )
         return out
+
+    def train_inlet_warmup(self,
+                           n_iterations: int   = 5_000,
+                           lr:           float = 5e-4,
+                           log_every:    int   = 500):
+        """
+        Inlet boundary condition warmup phase (Section 3.4.6, fix for AC1).
+
+        Before the full physics residual is engaged, this pre-training step
+        forces the network to learn the parabolic inlet profile and no-slip
+        wall condition in isolation.  The physics weights are held at 0.001
+        (essentially off) while the inlet weight is elevated to 50.0 and the
+        wall/neck weights to 30.0/40.0.
+
+        This prevents the large O(10^6–10^7) raw momentum residuals from
+        overwhelming the inlet gradient during the first thousand iterations —
+        the failure mode that caused AC1 to fail (ε_u = 55.69%) in the
+        original training run.  On completion, the weights are restored to
+        their nominal values ready for curriculum-ramped Adam training.
+
+        Protocol:
+            w_mom  = 0.001   (physics nearly off)
+            w_cont = 0.001
+            w_in   = 50.0    (inlet profile: heavy enforcement)
+            w_wall = 30.0    (no-slip: artery + sac wall)
+            w_neck = 40.0    (neck: geometrically critical)
+            w_out  = 5.0
+            w_pref = 0.0     (sac pressure reference: off during warmup)
+        """
+        Re = self.fp["Re"]
+        print(f"\n{'='*60}")
+        print(f"Inlet Warmup — Stage 5 Aneurysm  (Re = {Re})")
+        print(f"  {n_iterations} iterations, physics nearly off (w=0.001)")
+        print(f"{'='*60}")
+
+        # Save nominal weights and override with warmup weights
+        nom_mom  = self.loss_fn.w_mom
+        nom_cont = self.loss_fn.w_cont
+        nom_wall = self.loss_fn.w_wall
+        nom_neck = self.loss_fn.w_neck
+        nom_in   = self.loss_fn.w_in
+        nom_pref = self.loss_fn.w_pref
+
+        self.loss_fn.w_mom  = 0.001
+        self.loss_fn.w_cont = 0.001
+        self.loss_fn.w_wall = 30.0
+        self.loss_fn.w_neck = 40.0
+        self.loss_fn.w_in   = 50.0
+        self.loss_fn.w_pref = 0.0
+
+        optimizer = Adam(self.model.parameters(), lr=lr)
+        x_int, x_wall, x_neck, x_in, x_out, x_sac_int = self._prepare_tensors()
+        t0 = time.time()
+
+        for it in range(1, n_iterations + 1):
+            self.model.train()
+            optimizer.zero_grad()
+            (total, Lm, Lc, Lbc,
+             Lw, Lnk, Li, Lo, Lp) = self._compute_loss(
+                x_int, x_wall, x_neck, x_in, x_out, x_sac_int
+            )
+            total.backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            optimizer.step()
+
+            if total.item() < self.best_loss:
+                self.best_loss  = total.item()
+                self.best_state = {k: v.clone()
+                                   for k, v in self.model.state_dict().items()}
+
+            if it % log_every == 0:
+                print(f"  Warmup {it:5d}/{n_iterations}  "
+                      f"Loss={total.item():.4e}  "
+                      f"Inlet={Li.item():.4e}  Wall={Lw.item():.4e}  "
+                      f"t={time.time()-t0:.1f}s")
+
+        # Restore nominal weights for main Adam training
+        self.loss_fn.w_mom  = nom_mom
+        self.loss_fn.w_cont = nom_cont
+        self.loss_fn.w_wall = nom_wall
+        self.loss_fn.w_neck = nom_neck
+        self.loss_fn.w_in   = nom_in
+        self.loss_fn.w_pref = nom_pref
+        print(f"Warmup complete (Re={Re}). Nominal weights restored.")
 
     def train_adam(self,
                    n_iterations:  int   = 40_000,
@@ -534,9 +631,24 @@ class AneurysmTrainer:
         x_int, x_wall, x_neck, x_in, x_out, x_sac_int = self._prepare_tensors()
         t0 = time.time()
 
+        # Store nominal (post-warmup) physics weights for the ramp calculation
+        base_w_mom  = self.loss_fn.w_mom
+        base_w_cont = self.loss_fn.w_cont
+
         for it in range(1, n_iterations + 1):
             self.model.train()
             optimizer.zero_grad()
+
+            # ── Curriculum physics ramp ────────────────────────────────────
+            # Ramp physics weight from 0.001 → nominal over first 10,000
+            # iterations, exactly mirroring Stage 2's ramp that made AC1
+            # pass (Section 3.4.6, PINNTrainer.train_adam, ramp variable).
+            # This prevents large raw momentum residuals from destroying the
+            # inlet profile that the warmup phase just established.
+            ramp = min(1.0, 0.001 + 0.999 * (it / 10_000))
+            self.loss_fn.w_mom  = ramp * base_w_mom
+            self.loss_fn.w_cont = ramp * base_w_cont
+            # ──────────────────────────────────────────────────────────────
 
             (total, Lm, Lc, Lbc,
              Lw, Lnk, Li, Lo, Lp) = self._compute_loss(
@@ -546,6 +658,12 @@ class AneurysmTrainer:
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
             optimizer.step()
             scheduler.step()
+
+            # Save best checkpoint every iteration
+            if total.item() < self.best_loss:
+                self.best_loss  = total.item()
+                self.best_state = {k: v.clone()
+                                   for k, v in self.model.state_dict().items()}
 
             for key, val in zip(
                 ["loss","L_mom","L_cont","L_bc","L_wall","L_neck","L_in","L_out","L_pref"],
@@ -562,16 +680,12 @@ class AneurysmTrainer:
                       f"t={time.time()-t0:.1f}s")
 
             if it % check_grad_every == 0:
-                try:
-                    dom, norms, ratio = check_gradient_dominance(
-                        self.model, [Lm, Lc, Lbc]
-                    )
-                    if dom:
-                        print(f"  [WARN] Gradient dominance at iter {it}: "
-                              f"ratio={ratio:.1f}")
-                except RuntimeError:
-                    dom = False
-                    print(f"  [GradCheck {it}] skipped (graph freed)")
+                dom, norms, ratio = check_gradient_dominance(
+                    self.model, [Lm, Lc, Lbc]
+                )
+                if dom:
+                    print(f"  [WARN] Gradient dominance at iter {it}: "
+                          f"ratio={ratio:.1f}")
 
         print(f"Adam complete (Re={Re}). "
               f"Final loss: {self.history['loss'][-1]:.4e}")
@@ -587,17 +701,25 @@ class AneurysmTrainer:
         print(f"L-BFGS Refinement — Stage 5 Aneurysm  (Re = {Re})")
         print(f"{'='*60}")
 
+        # Restore best Adam checkpoint before L-BFGS (mirrors Stage 2 protocol)
+        if self.best_state is not None:
+            self.model.load_state_dict(self.best_state)
+            print(f"  Loaded best Adam state (loss={self.best_loss:.4e})")
+
         optimizer = LBFGS(
             self.model.parameters(),
             max_iter=20,
             history_size=history_size,
-            tolerance_grad=tolerance,
+            tolerance_grad=1e-7,       # tightened from 1e-6 (mirrors Stage 2)
+            tolerance_change=1e-9,     # added (mirrors Stage 2)
             line_search_fn="strong_wolfe"
         )
         x_int, x_wall, x_neck, x_in, x_out, x_sac_int = self._prepare_tensors(
             n_sub=self.lbfgs_sub
         )
         iter_count = [0]
+        prev_loss  = float("inf")
+        n_stagnant = 0
         t0 = time.time()
 
         def closure():
@@ -617,6 +739,15 @@ class AneurysmTrainer:
             self.history["loss"].append(
                 loss_val.item() if loss_val is not None else float('nan')
             )
+
+            # Stagnation detection (mirrors Stage 2 convergence check)
+            cur = loss_val.item() if loss_val is not None else prev_loss
+            rel_change = abs(prev_loss - cur) / (abs(prev_loss) + 1e-10)
+            n_stagnant = n_stagnant + 1 if rel_change < tolerance else 0
+            if n_stagnant >= 50:   # 50 outer steps × 20 inner = 1000 iters stagnant
+                print(f"  Converged at L-BFGS iter {iter_count[0]}")
+                break
+            prev_loss = cur
 
         print(f"L-BFGS complete (Re={Re}). "
               f"Final loss: {self.history['loss'][-1]:.4e}")
@@ -977,28 +1108,30 @@ def multi_re_study(data: dict,
 
         # Warm-start
         if Re != 250 and os.path.exists(base_model_path):
-            ckpt = torch.load(base_model_path, map_location=DEVICE, weights_only=False)
+            ckpt = torch.load(base_model_path, map_location=DEVICE)
             model.load_state_dict(ckpt["model_state_dict"])
             print(f"  Warm-started from Re=250 model: {base_model_path}")
         elif os.path.exists(f"pinn_caseC_Re{Re}.pt"):
-            ckpt = torch.load(f"pinn_caseC_Re{Re}.pt", map_location=DEVICE, weights_only=False)
+            ckpt = torch.load(f"pinn_caseC_Re{Re}.pt", map_location=DEVICE)
             model.load_state_dict(ckpt["model_state_dict"])
             print(f"  Loaded existing model for Re={Re}")
         else:
             # Warm-start from Stage 4 curved pipe if available
             stage4_path = "pinn_caseB_nonnewtonian.pt"
             if os.path.exists(stage4_path):
-                ckpt = torch.load(stage4_path, map_location=DEVICE, weights_only=False)
+                ckpt = torch.load(stage4_path, map_location=DEVICE)
                 model.load_state_dict(ckpt["model_state_dict"])
                 print(f"  Warm-started from Stage 4: {stage4_path}")
 
         # Train
-        loss_fn = AneurysmLoss()
+        loss_fn = AneurysmLoss(u_max=fp["u_max"])   # Re-specific momentum scaling
         trainer = AneurysmTrainer(
             model, loss_fn, normaliser, data, fp,
             neck_mask, sac_int_mask, lbfgs_subsample=10_000
         )
-        n_adam = 40_000 if Re == 250 else 20_000    # fewer iters for warm-starts
+        n_warmup = 5_000 if Re == 250 else 3_000
+        n_adam   = 40_000 if Re == 250 else 30_000  # increased from 20,000
+        trainer.train_inlet_warmup(n_iterations=n_warmup)
         trainer.train_adam(n_iterations=n_adam)
         trainer.train_lbfgs(max_iter=8_000)
 
@@ -1403,7 +1536,7 @@ def load_aneurysm_model(Re: float,
     if not os.path.exists(path):
         path = f"pinn_caseC_Re{Re:.0f}.pt"
     model = PINN(n_input=3, n_hidden=64, n_layers=5, n_output=4).to(DEVICE)
-    ckpt  = torch.load(path, map_location=DEVICE, weights_only=False)
+    ckpt  = torch.load(path, map_location=DEVICE)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
     print(f"[Load] Model loaded: {path}  (Re={ckpt['Re']}, "
@@ -1530,19 +1663,20 @@ if __name__ == "__main__":
     for warm_path in ["pinn_caseB_nonnewtonian.pt",
                       "pinn_caseA_nonnewtonian.pt"]:
         if os.path.exists(warm_path):
-            ckpt = torch.load(warm_path, map_location=DEVICE, weights_only=False)
+            ckpt = torch.load(warm_path, map_location=DEVICE)
             model_250.load_state_dict(ckpt["model_state_dict"])
             print(f"  Warm-started from: {warm_path}")
             break
     else:
         print("  Training from random (Glorot) initialisation")
 
-    loss_fn_250 = AneurysmLoss()
+    loss_fn_250 = AneurysmLoss(u_max=fp_250["u_max"])   # pass u_max for P_SCALE
     trainer_250 = AneurysmTrainer(
         model_250, loss_fn_250, normaliser, data,
         fp_250, neck_mask, sac_int_mask,
         lbfgs_subsample=10_000
     )
+    trainer_250.train_inlet_warmup(n_iterations=5_000)  # BC warmup before physics
     trainer_250.train_adam(n_iterations=40_000)
     trainer_250.train_lbfgs(max_iter=8_000)
 
@@ -1578,7 +1712,7 @@ if __name__ == "__main__":
     # 7. Plots — Re = 250
     # ----------------------------------------------------------------
     print("\n[Step 7] Generating plots — Re = 250")
-    pass  # skip - history format mismatch
+    plot_training_history(trainer_250.history)
     plot_wss_risk_map(wss_data_250["wss_nn"], data["wall"],
                       region_masks, Re=250)
     plot_wssg_distribution(wssg_250, data["wall"], region_masks, Re=250)
@@ -1611,16 +1745,17 @@ if __name__ == "__main__":
         fp_other  = flow_params(Re_other)
         model_oth = PINN(n_input=3, n_hidden=64, n_layers=5, n_output=4).to(DEVICE)
         # Warm-start from Re=250 solution
-        ckpt_250  = torch.load("pinn_caseC_Re250.pt", map_location=DEVICE, weights_only=False)
+        ckpt_250  = torch.load("pinn_caseC_Re250.pt", map_location=DEVICE)
         model_oth.load_state_dict(ckpt_250["model_state_dict"])
         print(f"\n  Training Re={Re_other} (warm-started from Re=250)...")
 
-        loss_oth    = AneurysmLoss()
+        loss_oth    = AneurysmLoss(u_max=fp_other["u_max"])  # Re-specific P_SCALE
         trainer_oth = AneurysmTrainer(
             model_oth, loss_oth, normaliser, data,
             fp_other, neck_mask, sac_int_mask, lbfgs_subsample=10_000
         )
-        trainer_oth.train_adam(n_iterations=20_000)
+        trainer_oth.train_inlet_warmup(n_iterations=3_000)  # shorter warmup (warm-started)
+        trainer_oth.train_adam(n_iterations=30_000)          # increased from 20,000
         trainer_oth.train_lbfgs(max_iter=5_000)
 
         wss_oth  = compute_aneurysm_wss(model_oth, normaliser,
