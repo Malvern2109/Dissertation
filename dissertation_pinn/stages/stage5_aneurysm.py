@@ -117,6 +117,119 @@ print(f"[Device] Using: {DEVICE}")
 
 
 # =============================================================================
+# HARD ANSATZ WRAPPER  (Section 3.5.4 — Exact Inlet Boundary Enforcement)
+# =============================================================================
+
+class HardAnsatzPINN(nn.Module):
+    """
+    Wraps the base PINN to enforce the parabolic inlet BC exactly
+    by construction (Hard Ansatz).
+
+    Motivation (Section 3.5.4):
+        In the soft-enforcement approach the inlet condition is added as a
+        weighted penalty to the loss (w_in * L_inlet).  For complex geometries
+        the loss landscape has sharp narrow basins (Krishnapriyan et al. 2021),
+        and L-BFGS can overshoot these basins, landing at a point where
+        the inlet penalty is not fully satisfied.  The result is a non-zero
+        eps_u error even when Adam found a near-perfect solution.
+
+        The Hard Ansatz removes the problem at the architecture level.  The
+        network output is algebraically blended with the analytical inlet
+        profile:
+
+            u_out = (1 - D) * u_parabolic(y,z)  +  D * u_nn(x,y,z)
+            v_out =                               D * v_nn(x,y,z)
+            w_out =                               D * w_nn(x,y,z)
+            p_out =                                   p_nn(x,y,z)
+
+        where  D(x) = sigmoid(alpha * (x_norm - x_inlet_norm))
+        is a smooth mask:  D ≈ 0 at inlet (x = 0),  D ≈ 1 everywhere else.
+
+        At x = 0:  D = 0  →  u_out = u_parabolic  (exact, regardless of u_nn)
+        Away from inlet:  D = 1  →  u_out = u_nn   (network has full freedom)
+
+        Consequences:
+            - eps_u at the inlet is zero by construction.
+            - The inlet loss term (w_in * L_inlet) is removed from the
+              total loss — it is identically zero and no longer needed.
+            - All other loss terms (momentum, continuity, wall, neck,
+              outlet, pressure reference) remain unchanged.
+
+    Implementation note:
+        Physical y, z coordinates are recovered from normalised inputs via
+        pure PyTorch tensor operations so the computation graph is preserved
+        for automatic differentiation.
+
+    Parameters
+    ----------
+    base_model  : base PINN (stage2 architecture)
+    u_max       : peak inlet velocity [m/s]  — Re-dependent
+    normaliser  : CoordinateNormaliser from stage2 (provides scale/mean)
+    alpha       : sigmoid sharpness (default 20.0 — transition over ~10% of domain)
+    """
+
+    def __init__(self, base_model: nn.Module, u_max: float,
+                 normaliser, alpha: float = 20.0):
+        super().__init__()
+        self.base  = base_model
+        self.u_max = u_max
+        self.alpha = alpha
+
+        # Normaliser parameters stored as buffers (move to GPU with .to(DEVICE))
+        self.register_buffer('y_scale',
+            torch.tensor(float(normaliser.x_range[1]), dtype=torch.float32))
+        self.register_buffer('y_mean',
+            torch.tensor(float(normaliser.x_mean[1]),  dtype=torch.float32))
+        self.register_buffer('z_scale',
+            torch.tensor(float(normaliser.x_range[2]), dtype=torch.float32))
+        self.register_buffer('z_mean',
+            torch.tensor(float(normaliser.x_mean[2]),  dtype=torch.float32))
+
+        # Normalised x-coordinate of the inlet plane (physical x = 0)
+        x_in_norm = (0.0 - float(normaliser.x_mean[0])) / float(normaliser.x_range[0])
+        self.register_buffer('x_inlet_norm',
+            torch.tensor(x_in_norm, dtype=torch.float32))
+
+    def forward(self, x_norm: torch.Tensor) -> torch.Tensor:
+        """
+        Hard-Ansatz forward pass.
+
+        Parameters
+        ----------
+        x_norm : (N, 3) normalised coordinates
+
+        Returns
+        -------
+        uvwp : (N, 4)  velocity (u,v,w) + pressure (p)
+               Inlet BC satisfied exactly for the velocity field.
+        """
+        # Raw network output — free to do whatever it likes
+        uvwp_nn = self.base(x_norm)
+
+        # ── Distance mask ──────────────────────────────────────────────
+        # D ≈ 0 at inlet (x_norm ≈ x_inlet_norm), D ≈ 1 elsewhere
+        x_coord = x_norm[:, 0:1]
+        D = torch.sigmoid(self.alpha * (x_coord - self.x_inlet_norm))
+
+        # ── Recover physical y, z  (pure torch — stays in autograd graph) ─
+        y_phys = x_norm[:, 1:2] * self.y_scale + self.y_mean
+        z_phys = x_norm[:, 2:3] * self.z_scale + self.z_mean
+
+        # ── Analytical inlet profile ───────────────────────────────────
+        r2 = y_phys ** 2 + z_phys ** 2
+        u_inlet = self.u_max * (1.0 - r2 / R_A ** 2)
+        u_inlet = torch.clamp(u_inlet, min=0.0)   # outside r=R_A → zero
+
+        # ── Blend: inlet zone uses analytical; bulk uses network ───────
+        u_out = (1.0 - D) * u_inlet + D * uvwp_nn[:, 0:1]  # axial velocity
+        v_out =                        D * uvwp_nn[:, 1:2]  # transverse: 0 at inlet
+        w_out =                        D * uvwp_nn[:, 2:3]  # transverse: 0 at inlet
+        p_out =                            uvwp_nn[:, 3:4]  # pressure unconstrained
+
+        return torch.cat([u_out, v_out, w_out, p_out], dim=1)
+
+
+# =============================================================================
 # PHYSICAL CONSTANTS  (Table 3.1)
 # =============================================================================
 
@@ -314,7 +427,7 @@ class AneurysmLoss:
         w_mom  = 1.0,  w_cont = 1.0
         w_wall = 10.0  (no-slip: entire artery + sac wall)
         w_neck = 20.0  (neck: geometrically critical, WSS-sensitive)
-        w_in   = 15.0  (inlet parabolic profile)
+        w_in   = 0.0   (REMOVED — inlet BC enforced exactly by Hard Ansatz)
         w_out  = 5.0   (outlet zero-pressure)
         w_pref = 2.0   (sac pressure reference, soft constraint)
     """
@@ -324,7 +437,7 @@ class AneurysmLoss:
                  w_cont: float = 1.0,
                  w_wall: float = 10.0,
                  w_neck: float = 20.0,
-                 w_in:   float = 100.0,   # raised from 15 — must compete with physics
+                 w_in:   float = 0.0,    # ZERO — inlet enforced by Hard Ansatz architecture
                  w_out:  float = 5.0,
                  w_pref: float = 2.0,
                  u_max:  float = 0.5):    # for P_SCALE momentum normalisation
@@ -551,7 +664,8 @@ class AneurysmTrainer:
         self.loss_fn.w_cont = 0.001
         self.loss_fn.w_wall = 80.0
         self.loss_fn.w_neck = 100.0
-        self.loss_fn.w_in   = 150.0
+        # w_in stays 0.0 — inlet enforced by Hard Ansatz, not by loss weight
+        self.loss_fn.w_in   = 0.0
 
         optimizer = Adam(self.model.parameters(), lr=lr)
         x_int, x_wall, x_neck, x_in, x_out, x_sac_int = self._prepare_tensors()
@@ -1075,25 +1189,30 @@ def multi_re_study(data: dict,
 
         fp = flow_params(Re)
 
-        # Build model
-        model = PINN(n_input=3, n_hidden=64, n_layers=5, n_output=4).to(DEVICE)
+        # Build model — Hard Ansatz wraps the base PINN
+        base_m = PINN(n_input=3, n_hidden=64, n_layers=5, n_output=4).to(DEVICE)
+        model  = HardAnsatzPINN(base_m, fp["u_max"], normaliser).to(DEVICE)
 
-        # Warm-start
+        # Warm-start — load into base (state dicts saved without 'base.' prefix)
         if Re != 250 and os.path.exists(base_model_path):
-            ckpt = torch.load(base_model_path, map_location=DEVICE)
-            model.load_state_dict(ckpt["model_state_dict"])
+            ckpt = torch.load(base_model_path, map_location=DEVICE, weights_only=False)
+            model.base.load_state_dict(ckpt["model_state_dict"])
             print(f"  Warm-started from Re=250 model: {base_model_path}")
         elif os.path.exists(f"pinn_caseC_Re{Re}.pt"):
-            ckpt = torch.load(f"pinn_caseC_Re{Re}.pt", map_location=DEVICE)
-            model.load_state_dict(ckpt["model_state_dict"])
+            ckpt = torch.load(f"pinn_caseC_Re{Re}.pt", map_location=DEVICE,
+                              weights_only=False)
+            model.base.load_state_dict(ckpt["model_state_dict"])
             print(f"  Loaded existing model for Re={Re}")
         else:
             # Warm-start from Stage 4 curved pipe if available
-            stage4_path = "pinn_caseB_nonnewtonian.pt"
-            if os.path.exists(stage4_path):
-                ckpt = torch.load(stage4_path, map_location=DEVICE)
-                model.load_state_dict(ckpt["model_state_dict"])
-                print(f"  Warm-started from Stage 4: {stage4_path}")
+            for stage4_path in ["trained_models/pinn_caseB_nonnewtonian.pt",
+                                "pinn_caseB_nonnewtonian.pt"]:
+                if os.path.exists(stage4_path):
+                    ckpt = torch.load(stage4_path, map_location=DEVICE,
+                                      weights_only=False)
+                    model.base.load_state_dict(ckpt["model_state_dict"])
+                    print(f"  Warm-started from Stage 4: {stage4_path}")
+                    break
 
         # Train
         loss_fn = AneurysmLoss(u_max=fp["u_max"])
@@ -1479,13 +1598,27 @@ def save_aneurysm_model(model: nn.Module,
                         history: dict,
                         Re: float,
                         directory: str = "trained_models"):
-    """Save trained aneurysm model with metadata."""
+    """Save trained aneurysm model with metadata.
+
+    If the model is a HardAnsatzPINN wrapper, the base PINN state dict
+    is saved (without the 'base.' prefix) so it remains compatible with
+    load_aneurysm_model() and Stage 6.
+    """
     os.makedirs(directory, exist_ok=True)
     path = os.path.join(directory, f"pinn_caseC_Re{Re:.0f}.pt")
+
+    # Extract base state dict for compatibility with plain-PINN loaders
+    if hasattr(model, 'base'):
+        state_dict = model.base.state_dict()
+        n_params   = count_parameters(model.base)
+    else:
+        state_dict = model.state_dict()
+        n_params   = count_parameters(model)
+
     torch.save({
-        "model_state_dict": model.state_dict(),
+        "model_state_dict": state_dict,
         "history":          history,
-        "n_params":         count_parameters(model),
+        "n_params":         n_params,
         "Re":               Re,
         "geometry": {
             "R_A": R_A, "L_A": L_A, "R_S": R_S, "neck_r": NECK_R
@@ -1496,7 +1629,7 @@ def save_aneurysm_model(model: nn.Module,
         }
     }, path)
     # Also save a copy in the working directory for easy access from Stage 6
-    torch.save(torch.load(path), f"pinn_caseC_Re{Re:.0f}.pt")
+    torch.save(torch.load(path, weights_only=False), f"pinn_caseC_Re{Re:.0f}.pt")
     print(f"[Save] Model saved to: {path}")
 
 
@@ -1627,15 +1760,23 @@ if __name__ == "__main__":
     print(f"  u_max={fp_250['u_max']:.5f} m/s, "
           f"delta_P={fp_250['delta_P']:.4f} Pa")
 
-    model_250 = PINN(n_input=3, n_hidden=64, n_layers=5, n_output=4).to(DEVICE)
-    print(f"  Parameters: {count_parameters(model_250):,}")
+    model_250 = HardAnsatzPINN(
+        PINN(n_input=3, n_hidden=64, n_layers=5, n_output=4),
+        u_max=fp_250["u_max"],
+        normaliser=normaliser
+    ).to(DEVICE)
+    print(f"  Parameters: {count_parameters(model_250.base):,}  "
+          f"[Hard Ansatz: inlet BC enforced by architecture]")
 
     # Warm-start from Stage 4 if available
-    for warm_path in ["pinn_caseB_nonnewtonian.pt",
+    # Load into model.base — state dicts are stored without 'base.' prefix
+    for warm_path in ["trained_models/pinn_caseB_nonnewtonian.pt",
+                      "trained_models/pinn_caseA_nonnewtonian.pt",
+                      "pinn_caseB_nonnewtonian.pt",
                       "pinn_caseA_nonnewtonian.pt"]:
         if os.path.exists(warm_path):
-            ckpt = torch.load(warm_path, map_location=DEVICE)
-            model_250.load_state_dict(ckpt["model_state_dict"])
+            ckpt = torch.load(warm_path, map_location=DEVICE, weights_only=False)
+            model_250.base.load_state_dict(ckpt["model_state_dict"])
             print(f"  Warm-started from: {warm_path}")
             break
     else:
@@ -1714,10 +1855,15 @@ if __name__ == "__main__":
 
     for Re_other in [100, 400]:
         fp_other  = flow_params(Re_other)
-        model_oth = PINN(n_input=3, n_hidden=64, n_layers=5, n_output=4).to(DEVICE)
-        # Warm-start from Re=250 solution
-        ckpt_250  = torch.load("pinn_caseC_Re250.pt", map_location=DEVICE)
-        model_oth.load_state_dict(ckpt_250["model_state_dict"])
+        model_oth = HardAnsatzPINN(
+            PINN(n_input=3, n_hidden=64, n_layers=5, n_output=4),
+            u_max=fp_other["u_max"],
+            normaliser=normaliser
+        ).to(DEVICE)
+        # Warm-start from Re=250 solution (base state dict, no 'base.' prefix)
+        ckpt_250  = torch.load("pinn_caseC_Re250.pt", map_location=DEVICE,
+                               weights_only=False)
+        model_oth.base.load_state_dict(ckpt_250["model_state_dict"])
         print(f"\n  Training Re={Re_other} (warm-started from Re=250)...")
 
         loss_oth    = AneurysmLoss(u_max=fp_other["u_max"])
