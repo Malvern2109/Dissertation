@@ -175,20 +175,18 @@ class HardAnsatzPINN(nn.Module):
         self.u_max = u_max
         self.alpha = alpha
 
-        # Normaliser uses: x_norm = 2*(x - x_min)/x_range - 1
-        # Inverse:         x_phys = (x_norm + 1) * x_range/2 + x_min
-        self.register_buffer('y_range_half',
-            torch.tensor(float(normaliser.x_range[1]) / 2.0, dtype=torch.float32))
-        self.register_buffer('y_min',
-            torch.tensor(float(normaliser.x_min[1]),          dtype=torch.float32))
-        self.register_buffer('z_range_half',
-            torch.tensor(float(normaliser.x_range[2]) / 2.0, dtype=torch.float32))
-        self.register_buffer('z_min',
-            torch.tensor(float(normaliser.x_min[2]),          dtype=torch.float32))
+        # Normaliser parameters stored as buffers (move to GPU with .to(DEVICE))
+        self.register_buffer('y_scale',
+            torch.tensor(float(normaliser.x_range[1]), dtype=torch.float32))
+        self.register_buffer('y_mean',
+            torch.tensor(float(normaliser.x_mean[1]),  dtype=torch.float32))
+        self.register_buffer('z_scale',
+            torch.tensor(float(normaliser.x_range[2]), dtype=torch.float32))
+        self.register_buffer('z_mean',
+            torch.tensor(float(normaliser.x_mean[2]),  dtype=torch.float32))
 
         # Normalised x-coordinate of the inlet plane (physical x = 0)
-        # x_norm = 2*(0 - x_min[0])/x_range[0] - 1
-        x_in_norm = 2.0 * (0.0 - float(normaliser.x_min[0])) / float(normaliser.x_range[0]) - 1.0
+        x_in_norm = (0.0 - float(normaliser.x_mean[0])) / float(normaliser.x_range[0])
         self.register_buffer('x_inlet_norm',
             torch.tensor(x_in_norm, dtype=torch.float32))
 
@@ -214,9 +212,8 @@ class HardAnsatzPINN(nn.Module):
         D = torch.sigmoid(self.alpha * (x_coord - self.x_inlet_norm))
 
         # ── Recover physical y, z  (pure torch — stays in autograd graph) ─
-        # Inverse normalisation: x_phys = (x_norm + 1) * x_range/2 + x_min
-        y_phys = (x_norm[:, 1:2] + 1.0) * self.y_range_half + self.y_min
-        z_phys = (x_norm[:, 2:3] + 1.0) * self.z_range_half + self.z_min
+        y_phys = x_norm[:, 1:2] * self.y_scale + self.y_mean
+        z_phys = x_norm[:, 2:3] * self.z_scale + self.z_mean
 
         # ── Analytical inlet profile ───────────────────────────────────
         r2 = y_phys ** 2 + z_phys ** 2
@@ -427,30 +424,41 @@ class AneurysmLoss:
           + w_pref*L_p_ref
 
     Weights (Section 3.4.5 / Table 3.3):
-        w_mom  = 1.0,  w_cont = 1.0
-        w_wall = 10.0  (no-slip: entire artery + sac wall)
-        w_neck = 20.0  (neck: geometrically critical, WSS-sensitive)
-        w_in   = 0.0   (REMOVED — inlet BC enforced exactly by Hard Ansatz)
-        w_out  = 5.0   (outlet zero-pressure)
-        w_pref = 2.0   (sac pressure reference, soft constraint)
+        w_mom     = 1.0,  w_cont = 1.0
+        w_wall    = 10.0  (no-slip: entire artery + sac wall)
+        w_neck    = 20.0  (neck: geometrically critical, WSS-sensitive)
+        w_in      = 0.0   (REMOVED -- inlet BC enforced exactly by Hard Ansatz)
+        w_out     = 5.0   (outlet zero-pressure)
+        w_out_vel = 50.0  (outlet parabolic velocity -- prevents trivial zero solution)
+        w_pref    = 2.0   (sac pressure reference, soft constraint)
+
+    Note on w_out_vel (Section 3.5.4):
+        With the Hard Ansatz the inlet velocity is exact, but the network can
+        find a degenerate solution: u~0 everywhere except at x=0 where the
+        Ansatz forces the correct profile. This satisfies physics (u=0 is a
+        valid NS solution with p=const) but is physically wrong.
+        Enforcing a parabolic velocity at the outlet (fully-developed flow
+        assumption -- valid for straight-pipe exit) breaks this degeneracy.
     """
 
     def __init__(self,
-                 w_mom:  float = 1.0,
-                 w_cont: float = 1.0,
-                 w_wall: float = 10.0,
-                 w_neck: float = 20.0,
-                 w_in:   float = 0.0,    # ZERO — inlet enforced by Hard Ansatz architecture
-                 w_out:  float = 5.0,
-                 w_pref: float = 2.0,
-                 u_max:  float = 0.5):    # for P_SCALE momentum normalisation
-        self.w_mom  = w_mom
-        self.w_cont = w_cont
-        self.w_wall = w_wall
-        self.w_neck = w_neck
-        self.w_in   = w_in
-        self.w_out  = w_out
-        self.w_pref = w_pref
+                 w_mom:     float = 1.0,
+                 w_cont:    float = 1.0,
+                 w_wall:    float = 10.0,
+                 w_neck:    float = 20.0,
+                 w_in:      float = 0.0,    # ZERO -- inlet enforced by Hard Ansatz
+                 w_out:     float = 5.0,
+                 w_out_vel: float = 50.0,   # outlet velocity -- breaks trivial zero
+                 w_pref:    float = 2.0,
+                 u_max:     float = 0.5):   # for P_SCALE momentum normalisation
+        self.w_mom     = w_mom
+        self.w_cont    = w_cont
+        self.w_wall    = w_wall
+        self.w_neck    = w_neck
+        self.w_in      = w_in
+        self.w_out     = w_out
+        self.w_out_vel = w_out_vel
+        self.w_pref    = w_pref
         # P_SCALE: normalise momentum residuals from O(1e7) → O(1)
         # so they compete fairly with BC losses (which are O(1e-1 to 1e-3))
         self.P_SCALE = RHO * u_max**2 + 1e-10
@@ -499,6 +507,39 @@ class AneurysmLoss:
         """Zero gauge pressure at the artery outlet (x = L_A)."""
         return torch.mean(uvwp_outlet[:, 3:4]**2)
 
+    def outlet_velocity_loss(self, uvwp_outlet, x_outlet_phys: np.ndarray,
+                              u_max: float):
+        """
+        Soft parabolic velocity constraint at the outlet (x = L_A).
+
+        The parent artery outlet is a straight-pipe exit — fully-developed
+        Hagen-Poiseuille flow is a valid assumption. The target profile is
+        identical in form to the inlet:
+            u_x_target = u_max * (1 - (y^2 + z^2) / R_A^2)
+            v = w = 0
+
+        This constraint is critical with the Hard Ansatz: without it the
+        network finds the degenerate u~0 solution (valid for NS physics
+        but physically meaningless). By requiring the correct velocity at
+        BOTH ends of the artery, the network is forced to maintain flow
+        throughout the domain.
+
+        Weight w_out_vel = 50.0 -- same order as the original w_in = 100
+        but halved since the outlet is a soft constraint, not architecture-
+        level enforcement.
+        """
+        y  = x_outlet_phys[:, 1]
+        z  = x_outlet_phys[:, 2]
+        r2 = torch.tensor(y**2 + z**2, dtype=torch.float32,
+                          device=DEVICE).unsqueeze(1)
+        u_target = u_max * (1.0 - r2 / R_A**2)
+        u_target = torch.clamp(u_target, min=0.0)
+
+        loss_u  = torch.mean((uvwp_outlet[:, 0:1] - u_target)**2)
+        loss_vw = (torch.mean(uvwp_outlet[:, 1:2]**2)
+                 + torch.mean(uvwp_outlet[:, 2:3]**2))
+        return loss_u + loss_vw
+
     def pressure_ref_loss(self, uvwp_sac_interior):
         """
         Soft pressure reference inside the aneurysm sac (Section 3.5.3).
@@ -514,27 +555,29 @@ class AneurysmLoss:
     def total_loss(self, R_cont, R_x, R_y, R_z,
                    uvwp_wall, uvwp_neck,
                    uvwp_inlet, x_inlet_phys, u_max,
-                   uvwp_outlet,
+                   uvwp_outlet, x_outlet_phys,
                    uvwp_sac_int=None):
 
-        L_mom    = self.momentum_loss(R_x, R_y, R_z)
-        L_cont   = self.continuity_loss(R_cont)
-        L_wall   = self.wall_loss(uvwp_wall)
-        L_neck   = self.neck_loss(uvwp_neck)
-        L_inlet  = self.inlet_loss(uvwp_inlet, x_inlet_phys, u_max)
-        L_outlet = self.outlet_loss(uvwp_outlet)
-        L_pref   = self.pressure_ref_loss(uvwp_sac_int)
+        L_mom      = self.momentum_loss(R_x, R_y, R_z)
+        L_cont     = self.continuity_loss(R_cont)
+        L_wall     = self.wall_loss(uvwp_wall)
+        L_neck     = self.neck_loss(uvwp_neck)
+        L_inlet    = self.inlet_loss(uvwp_inlet, x_inlet_phys, u_max)
+        L_outlet   = self.outlet_loss(uvwp_outlet)
+        L_out_vel  = self.outlet_velocity_loss(uvwp_outlet, x_outlet_phys, u_max)
+        L_pref     = self.pressure_ref_loss(uvwp_sac_int)
 
-        L_bc = (self.w_wall * L_wall
-                + self.w_neck * L_neck
-                + self.w_in   * L_inlet
-                + self.w_out  * L_outlet
-                + self.w_pref * L_pref)
+        L_bc = (self.w_wall    * L_wall
+                + self.w_neck  * L_neck
+                + self.w_in    * L_inlet
+                + self.w_out   * L_outlet
+                + self.w_out_vel * L_out_vel
+                + self.w_pref  * L_pref)
 
         L_total = self.w_mom * L_mom + self.w_cont * L_cont + L_bc
 
         return (L_total, L_mom, L_cont, L_bc,
-                L_wall, L_neck, L_inlet, L_outlet, L_pref)
+                L_wall, L_neck, L_inlet, L_outlet, L_out_vel, L_pref)
 
 
 # =============================================================================
@@ -583,7 +626,7 @@ class AneurysmTrainer:
         self.history     = {
             "loss": [], "L_mom": [], "L_cont": [], "L_bc": [],
             "L_wall": [], "L_neck": [], "L_in": [],
-            "L_out": [], "L_pref": []
+            "L_out": [], "L_out_vel": [], "L_pref": []
         }
         # Best-state tracking for Adam → L-BFGS handoff
         self.best_loss  = float("inf")
@@ -634,7 +677,7 @@ class AneurysmTrainer:
             R_cont, R_x, R_y, R_z,
             uvwp_wall, uvwp_neck,
             uvwp_inlet, self.data["inlet"], self.fp["u_max"],
-            uvwp_outlet,
+            uvwp_outlet, self.data["outlet"],
             uvwp_sac
         )
         return out
@@ -657,18 +700,21 @@ class AneurysmTrainer:
         print(f"{'='*60}")
 
         # Save nominal weights, set physics near-zero
-        nom_mom  = self.loss_fn.w_mom
-        nom_cont = self.loss_fn.w_cont
-        nom_wall = self.loss_fn.w_wall
-        nom_neck = self.loss_fn.w_neck
-        nom_in   = self.loss_fn.w_in
+        nom_mom     = self.loss_fn.w_mom
+        nom_cont    = self.loss_fn.w_cont
+        nom_wall    = self.loss_fn.w_wall
+        nom_neck    = self.loss_fn.w_neck
+        nom_in      = self.loss_fn.w_in
+        nom_out_vel = self.loss_fn.w_out_vel
 
-        self.loss_fn.w_mom  = 0.001
-        self.loss_fn.w_cont = 0.001
-        self.loss_fn.w_wall = 80.0
-        self.loss_fn.w_neck = 100.0
-        # w_in stays 0.0 — inlet enforced by Hard Ansatz, not by loss weight
-        self.loss_fn.w_in   = 0.0
+        self.loss_fn.w_mom     = 0.001
+        self.loss_fn.w_cont    = 0.001
+        self.loss_fn.w_wall    = 80.0
+        self.loss_fn.w_neck    = 100.0
+        # w_in stays 0.0 -- inlet enforced by Hard Ansatz, not by loss weight
+        self.loss_fn.w_in      = 0.0
+        # Keep outlet velocity active -- prevents trivial zero forming during warmup
+        self.loss_fn.w_out_vel = 100.0
 
         optimizer = Adam(self.model.parameters(), lr=lr)
         x_int, x_wall, x_neck, x_in, x_out, x_sac_int = self._prepare_tensors()
@@ -678,7 +724,7 @@ class AneurysmTrainer:
             self.model.train()
             optimizer.zero_grad()
             (total, Lm, Lc, Lbc,
-             Lw, Lnk, Li, Lo, Lp) = self._compute_loss(
+             Lw, Lnk, Li, Lo, Lov, Lp) = self._compute_loss(
                 x_int, x_wall, x_neck, x_in, x_out, x_sac_int
             )
             total.backward()
@@ -694,16 +740,17 @@ class AneurysmTrainer:
             if it % 500 == 0:
                 print(f"  Warmup {it:5d}/{n_iterations}  "
                       f"Loss={total.item():.4e}  "
-                      f"Inlet={Li.item():.4e}  "
+                      f"OutVel={Lov.item():.4e}  "
                       f"Wall={Lw.item():.4e}  "
                       f"t={time.time()-t0:.1f}s")
 
         # Restore nominal weights
-        self.loss_fn.w_mom  = nom_mom
-        self.loss_fn.w_cont = nom_cont
-        self.loss_fn.w_wall = nom_wall
-        self.loss_fn.w_neck = nom_neck
-        self.loss_fn.w_in   = nom_in
+        self.loss_fn.w_mom     = nom_mom
+        self.loss_fn.w_cont    = nom_cont
+        self.loss_fn.w_wall    = nom_wall
+        self.loss_fn.w_neck    = nom_neck
+        self.loss_fn.w_in      = nom_in
+        self.loss_fn.w_out_vel = nom_out_vel
         print(f"Warmup complete (Re={Re}). Nominal weights restored.")
 
     def train_adam(self,
@@ -745,7 +792,7 @@ class AneurysmTrainer:
             self.loss_fn.w_cont = base_w_cont * ramp
 
             (total, Lm, Lc, Lbc,
-             Lw, Lnk, Li, Lo, Lp) = self._compute_loss(
+             Lw, Lnk, Li, Lo, Lov, Lp) = self._compute_loss(
                 x_int, x_wall, x_neck, x_in, x_out, x_sac_int
             )
             total.backward()
@@ -760,8 +807,9 @@ class AneurysmTrainer:
                                    for k, v in self.model.state_dict().items()}
 
             for key, val in zip(
-                ["loss","L_mom","L_cont","L_bc","L_wall","L_neck","L_in","L_out","L_pref"],
-                [total, Lm, Lc, Lbc, Lw, Lnk, Li, Lo, Lp]
+                ["loss","L_mom","L_cont","L_bc","L_wall","L_neck",
+                 "L_in","L_out","L_out_vel","L_pref"],
+                [total, Lm, Lc, Lbc, Lw, Lnk, Li, Lo, Lov, Lp]
             ):
                 self.history[key].append(val.item())
 
@@ -769,7 +817,7 @@ class AneurysmTrainer:
                 print(f"  Iter {it:6d}/{n_iterations}  "
                       f"Loss={total.item():.4e}  "
                       f"Mom={Lm.item():.4e}  Cont={Lc.item():.4e}  "
-                      f"Neck={Lnk.item():.4e}  "
+                      f"OutVel={Lov.item():.4e}  "
                       f"lr={scheduler.get_last_lr()[0]:.2e}  "
                       f"t={time.time()-t0:.1f}s")
 
