@@ -175,18 +175,20 @@ class HardAnsatzPINN(nn.Module):
         self.u_max = u_max
         self.alpha = alpha
 
-        # Normaliser parameters stored as buffers (move to GPU with .to(DEVICE))
-        self.register_buffer('y_scale',
-            torch.tensor(float(normaliser.x_range[1]), dtype=torch.float32))
-        self.register_buffer('y_mean',
-            torch.tensor(float(normaliser.x_mean[1]),  dtype=torch.float32))
-        self.register_buffer('z_scale',
-            torch.tensor(float(normaliser.x_range[2]), dtype=torch.float32))
-        self.register_buffer('z_mean',
-            torch.tensor(float(normaliser.x_mean[2]),  dtype=torch.float32))
+        # Normaliser uses: x_norm = 2*(x - x_min)/x_range - 1
+        # Inverse:         x_phys = (x_norm + 1) * x_range/2 + x_min
+        self.register_buffer('y_range_half',
+            torch.tensor(float(normaliser.x_range[1]) / 2.0, dtype=torch.float32))
+        self.register_buffer('y_min',
+            torch.tensor(float(normaliser.x_min[1]),          dtype=torch.float32))
+        self.register_buffer('z_range_half',
+            torch.tensor(float(normaliser.x_range[2]) / 2.0, dtype=torch.float32))
+        self.register_buffer('z_min',
+            torch.tensor(float(normaliser.x_min[2]),          dtype=torch.float32))
 
         # Normalised x-coordinate of the inlet plane (physical x = 0)
-        x_in_norm = (0.0 - float(normaliser.x_mean[0])) / float(normaliser.x_range[0])
+        # x_norm = 2*(0 - x_min[0])/x_range[0] - 1
+        x_in_norm = 2.0 * (0.0 - float(normaliser.x_min[0])) / float(normaliser.x_range[0]) - 1.0
         self.register_buffer('x_inlet_norm',
             torch.tensor(x_in_norm, dtype=torch.float32))
 
@@ -212,8 +214,9 @@ class HardAnsatzPINN(nn.Module):
         D = torch.sigmoid(self.alpha * (x_coord - self.x_inlet_norm))
 
         # ── Recover physical y, z  (pure torch — stays in autograd graph) ─
-        y_phys = x_norm[:, 1:2] * self.y_scale + self.y_mean
-        z_phys = x_norm[:, 2:3] * self.z_scale + self.z_mean
+        # Inverse normalisation: x_phys = (x_norm + 1) * x_range/2 + x_min
+        y_phys = (x_norm[:, 1:2] + 1.0) * self.y_range_half + self.y_min
+        z_phys = (x_norm[:, 2:3] + 1.0) * self.z_range_half + self.z_min
 
         # ── Analytical inlet profile ───────────────────────────────────
         r2 = y_phys ** 2 + z_phys ** 2
