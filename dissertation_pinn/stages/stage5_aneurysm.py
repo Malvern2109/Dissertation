@@ -176,17 +176,16 @@ class HardAnsatzPINN(nn.Module):
         self.alpha = alpha
 
         # Normaliser parameters stored as buffers (move to GPU with .to(DEVICE))
-        self.register_buffer('y_scale',
-            torch.tensor(float(normaliser.x_range[1]), dtype=torch.float32))
-        self.register_buffer('y_mean',
-            torch.tensor(float(normaliser.x_mean[1]),  dtype=torch.float32))
-        self.register_buffer('z_scale',
-            torch.tensor(float(normaliser.x_range[2]), dtype=torch.float32))
-        self.register_buffer('z_mean',
-            torch.tensor(float(normaliser.x_mean[2]),  dtype=torch.float32))
+        self.register_buffer('y_range_half',
+            torch.tensor(float(normaliser.x_range[1]) / 2.0, dtype=torch.float32))
+        self.register_buffer('y_min',
+            torch.tensor(float(normaliser.x_min[1]), dtype=torch.float32))
+        self.register_buffer('z_range_half',
+            torch.tensor(float(normaliser.x_range[2]) / 2.0, dtype=torch.float32))
+        self.register_buffer('z_min',
+            torch.tensor(float(normaliser.x_min[2]), dtype=torch.float32))
 
-        # Normalised x-coordinate of the inlet plane (physical x = 0)
-        x_in_norm = (0.0 - float(normaliser.x_mean[0])) / float(normaliser.x_range[0])
+        x_in_norm = 2.0 * (0.0 - float(normaliser.x_min[0])) / float(normaliser.x_range[0]) - 1.0
         self.register_buffer('x_inlet_norm',
             torch.tensor(x_in_norm, dtype=torch.float32))
 
@@ -212,8 +211,8 @@ class HardAnsatzPINN(nn.Module):
         D = torch.sigmoid(self.alpha * (x_coord - self.x_inlet_norm))
 
         # ── Recover physical y, z  (pure torch — stays in autograd graph) ─
-        y_phys = x_norm[:, 1:2] * self.y_scale + self.y_mean
-        z_phys = x_norm[:, 2:3] * self.z_scale + self.z_mean
+        y_phys = (x_norm[:, 1:2] + 1.0) * self.y_range_half + self.y_min
+        z_phys = (x_norm[:, 2:3] + 1.0) * self.z_range_half + self.z_min
 
         # ── Analytical inlet profile ───────────────────────────────────
         r2 = y_phys ** 2 + z_phys ** 2
@@ -1250,8 +1249,7 @@ def multi_re_study(data: dict,
             model.base.load_state_dict(ckpt["model_state_dict"])
             print(f"  Warm-started from Re=250 model: {base_model_path}")
         elif os.path.exists(f"pinn_caseC_Re{Re}.pt"):
-            ckpt = torch.load(f"pinn_caseC_Re{Re}.pt", map_location=DEVICE,
-                              weights_only=False)
+            ckpt = torch.load(f"pinn_caseC_Re{Re}.pt", map_location=DEVICE, weights_only=False)
             model.base.load_state_dict(ckpt["model_state_dict"])
             print(f"  Loaded existing model for Re={Re}")
         else:
@@ -1259,8 +1257,7 @@ def multi_re_study(data: dict,
             for stage4_path in ["trained_models/pinn_caseB_nonnewtonian.pt",
                                 "pinn_caseB_nonnewtonian.pt"]:
                 if os.path.exists(stage4_path):
-                    ckpt = torch.load(stage4_path, map_location=DEVICE,
-                                      weights_only=False)
+                    ckpt = torch.load(stage4_path, map_location=DEVICE, weights_only=False)
                     model.base.load_state_dict(ckpt["model_state_dict"])
                     print(f"  Warm-started from Stage 4: {stage4_path}")
                     break
@@ -1691,7 +1688,7 @@ def load_aneurysm_model(Re: float,
     if not os.path.exists(path):
         path = f"pinn_caseC_Re{Re:.0f}.pt"
     model = PINN(n_input=3, n_hidden=64, n_layers=5, n_output=4).to(DEVICE)
-    ckpt  = torch.load(path, map_location=DEVICE)
+    ckpt  = torch.load(path, map_location=DEVICE, weights_only=False)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
     print(f"[Load] Model loaded: {path}  (Re={ckpt['Re']}, "
@@ -1912,8 +1909,7 @@ if __name__ == "__main__":
             normaliser=normaliser
         ).to(DEVICE)
         # Warm-start from Re=250 solution (base state dict, no 'base.' prefix)
-        ckpt_250  = torch.load("pinn_caseC_Re250.pt", map_location=DEVICE,
-                               weights_only=False)
+        ckpt_250  = torch.load("pinn_caseC_Re250.pt", map_location=DEVICE, weights_only=False)
         model_oth.base.load_state_dict(ckpt_250["model_state_dict"])
         print(f"\n  Training Re={Re_other} (warm-started from Re=250)...")
 
