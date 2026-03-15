@@ -448,7 +448,7 @@ class AneurysmLoss:
                  w_neck:    float = 20.0,
                  w_in:      float = 0.0,    # ZERO -- inlet enforced by Hard Ansatz
                  w_out:     float = 5.0,
-                 w_out_vel: float = 50.0,   # outlet velocity -- breaks trivial zero
+                 w_out_vel: float = 10.0,   # outlet velocity -- breaks trivial zero
                  w_pref:    float = 2.0,
                  u_max:     float = 0.5):   # for P_SCALE momentum normalisation
         self.w_mom     = w_mom
@@ -714,7 +714,7 @@ class AneurysmTrainer:
         # w_in stays 0.0 -- inlet enforced by Hard Ansatz, not by loss weight
         self.loss_fn.w_in      = 0.0
         # Keep outlet velocity active -- prevents trivial zero forming during warmup
-        self.loss_fn.w_out_vel = 100.0
+        self.loss_fn.w_out_vel = 50.0
 
         optimizer = Adam(self.model.parameters(), lr=lr)
         x_int, x_wall, x_neck, x_in, x_out, x_sac_int = self._prepare_tensors()
